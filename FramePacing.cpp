@@ -3,7 +3,8 @@
 #include <SDL3/SDL_opengl.h>
 #include <cmath>
 #include <cstring>
-#include "OpenGLOnDXGI.h"
+#include "DXGISwapChainAdapter.h"
+#include <iostream>
 
 struct GameState {
     float blue_x, blue_y;
@@ -14,6 +15,8 @@ struct GameState {
 
     float pacer_x, pacer_y;
     float pacer_timer;
+
+    float view_w, view_h;
 };
 
 void game_render(double delta_time, double frame_percent, void* data);
@@ -36,16 +39,16 @@ void SDL_PaceFrame(Uint64 delta_time, SDL_FramePacingInfo* pacing_info);
 Uint64 SDL_GetFrameTime(SDL_Window* window);
 
 
-void SDL_Internal_FramePacing_PostPresent(OpenGLContext* ctx);
+void SDL_Internal_FramePacing_PostPresent(DXGISwapChainAdapter* ctx);
 void SDL_Internal_FramePacing_Init(SDL_Window* window);
 
 int main(int argc, char* argv[]) {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
-    SDL_Window* window = SDL_CreateWindow("Frame Pacing Sample (vsync on)", 1280, 720, SDL_WINDOW_OPENGL);
+    SDL_Window* window = SDL_CreateWindow("Frame Pacing Sample (vsync on)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_Internal_FramePacing_Init(window);
-    //SDL_GLContext glcontext = SDL_GL_CreateContext(window);
+    SDL_GLContext glcontext = SDL_GL_CreateContext(window);
     //SDL_GL_SetSwapInterval(1);
-    OpenGLContext* ctx = CreateDXGIGLContext(window);
+    DXGISwapChainAdapter* swapchain = CreateDXGISwapChainAdapter(window);
    
     bool running = true;
     bool vsync = true;
@@ -53,11 +56,14 @@ int main(int argc, char* argv[]) {
     GameState state = {0};
 
     SDL_FramePacingInfo pacing_info = {0};
-    pacing_info.update_rate = 144;
+    pacing_info.update_rate = 144;//DXGIGLRefreshRate(ctx);//143.963;
     pacing_info.fixed_update_callback = game_fixed_update;
     pacing_info.variable_update_callback = game_variable_update;
     pacing_info.render_callback = game_render;
     pacing_info.user_data = &state;
+
+
+    int framestats_out_counter = 0;
 
     while(running) {
         SDL_Event event;
@@ -77,17 +83,20 @@ int main(int argc, char* argv[]) {
                 }
             }
             if(event.type == SDL_EVENT_WINDOW_RESIZED || event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
-                DXGIGLResize(ctx, event.window.data1, event.window.data2);
+                DXGISwapChainAdapterResize(swapchain, event.window.data1, event.window.data2);
+                state.view_w = event.window.data1;
+                state.view_h = event.window.data2;
             }
         };
 
+        DXGISwapChainAdapterPrepareBuffers(swapchain);
+
         Uint64 frame_time = SDL_GetFrameTime(window);
-        DXGIGLPrepareBuffers(ctx);
         SDL_PaceFrame(frame_time, &pacing_info);
 
         //SDL_GL_SwapWindow(window);
-        DXGIGLSwapBuffers(ctx, vsync);
-        SDL_Internal_FramePacing_PostPresent(ctx);
+        DXGISwapChainAdapterSwapBuffers(swapchain, vsync);
+        SDL_Internal_FramePacing_PostPresent(swapchain);
     }
 
     return 0;
@@ -114,7 +123,7 @@ void draw_gl_rect(float x, float y, float w, float h) {
 
 void game_render(double delta_time, double frame_percent, void* data) {
     GameState* state = (GameState*)data;
-    glViewport(0, 0, 1280, 720);
+    glViewport(0, 0, state->view_w, state->view_h);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0, 1280, 0, 720, -1, 1); //when using DXGI swapchain the Y axis is inverted... i dont know how to fix on the swapchain level
@@ -153,10 +162,6 @@ void game_render(double delta_time, double frame_percent, void* data) {
         lerp(state->blue_previous_y, state->blue_y, frame_percent) - 20,
         40, 40
     );
-
-   // SDL_Delay(1);
-  //  glFinish();
-   
 }
 void game_fixed_update(double delta_time, void* data) {
     GameState* state = (GameState*)data;
@@ -168,6 +173,8 @@ void game_fixed_update(double delta_time, void* data) {
     //move blue box towards mouse at constant speed
     float mx, my;
     SDL_GetMouseState(&mx, &my);
+    mx *= 1280 / state->view_w;
+    my *= 720 / state->view_h;
 
     float vx = mx - state->blue_x;
     float vy = my - state->blue_y;
@@ -179,8 +186,6 @@ void game_fixed_update(double delta_time, void* data) {
 
     state->blue_x = clamp(state->blue_x, 0, 1280);
     state->blue_y = clamp(state->blue_y, 0, 720);
-
-    //SDL_Delay(1);
 }
 void game_variable_update(double delta_time, void* data) {
     //move red box in a sin wave
@@ -195,8 +200,6 @@ void game_variable_update(double delta_time, void* data) {
 
     state->pacer_x = sin(state->pacer_timer)*100 + 640;
     state->pacer_y = cos(state->pacer_timer)*100 + 360;
-
-   // SDL_Delay(1);
 }
 
 
@@ -275,9 +278,9 @@ void SDL_Internal_FramePacing_Init(SDL_Window* window) {
 }
 
 //this is done in the *dumb* way just so theres a baseline to compare a good implementation to
-void SDL_Internal_FramePacing_PostPresent(OpenGLContext* ctx) {
+void SDL_Internal_FramePacing_PostPresent(DXGISwapChainAdapter* ctx) {
     frame_timing_info.prev_frame_time = frame_timing_info.current_frame_time;
-    frame_timing_info.current_frame_time = DXGIGLGetPreviousSwapTimestamp(ctx);
+    frame_timing_info.current_frame_time = DXGISwapChainAdapterGetPreviousSwapTimestamp(ctx);
 
     frame_timing_info.delta_time = frame_timing_info.current_frame_time - frame_timing_info.prev_frame_time;
 }
