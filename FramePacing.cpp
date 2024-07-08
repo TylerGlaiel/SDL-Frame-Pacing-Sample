@@ -5,6 +5,7 @@
 #include <cstring>
 #include "DXGISwapChainAdapter.h"
 #include <iostream>
+#include "Windows.h"
 
 struct GameState {
     float blue_x, blue_y;
@@ -17,6 +18,7 @@ struct GameState {
     float pacer_timer;
 
     float view_w, view_h;
+    bool yflip;
 };
 
 void game_render(double delta_time, double frame_percent, void* data);
@@ -41,19 +43,23 @@ Uint64 SDL_GetFrameTime();
 
 void SDL_Internal_FramePacing_ComputeDeltaTime(DXGISwapChainAdapter* swapchain);
 void SDL_Internal_FramePacing_Init(SDL_Window* window);
+void SDL_Internal_SwapBuffersAndMeasureTime_NonDXGI(SDL_Window* window);
 
 int main(int argc, char* argv[]) {
+    bool use_dxgi = true;
+
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
     SDL_Window* window = SDL_CreateWindow("Frame Pacing Sample (vsync on)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_Internal_FramePacing_Init(window);
     SDL_GLContext glcontext = SDL_GL_CreateContext(window);
-    //SDL_GL_SetSwapInterval(1);
-    DXGISwapChainAdapter* swapchain = CreateDXGISwapChainAdapter(window);
+    if(!use_dxgi) SDL_GL_SetSwapInterval(1);
+    DXGISwapChainAdapter* swapchain = use_dxgi?CreateDXGISwapChainAdapter(window):NULL;
    
     bool running = true;
     bool vsync = true;
 
     GameState state = {0};
+    state.yflip = use_dxgi;
 
     SDL_FramePacingInfo pacing_info = {0};
     pacing_info.update_rate = 144;//DXGISwapChainAdapterRefreshRate(swapchain);//60;
@@ -74,7 +80,7 @@ int main(int argc, char* argv[]) {
             if(event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) { //click to toggle vsync
                 if(event.button.which == 0) {
                     vsync = !vsync;
-                    //SDL_GL_SetSwapInterval(vsync);
+                    if(!use_dxgi) SDL_GL_SetSwapInterval(vsync);
                     if(vsync) {
                         SDL_SetWindowTitle(window, "Frame Pacing Sample (vsync on)");
                     } else {
@@ -83,22 +89,23 @@ int main(int argc, char* argv[]) {
                 }
             }
             if(event.type == SDL_EVENT_WINDOW_RESIZED || event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
-                DXGISwapChainAdapterResize(swapchain, event.window.data1, event.window.data2);
+                if(use_dxgi) DXGISwapChainAdapterResize(swapchain, event.window.data1, event.window.data2);
                 state.view_w = event.window.data1;
                 state.view_h = event.window.data2;
             }
         };
 
-        DXGISwapChainAdapterPrepareBuffers(swapchain);
+        if(use_dxgi) DXGISwapChainAdapterPrepareBuffers(swapchain);
         SDL_Internal_FramePacing_ComputeDeltaTime(swapchain);
 
         Uint64 frame_time = SDL_GetFrameTime();
-       // std::cout << frame_time << std::endl;
-
         SDL_PaceFrame(frame_time, &pacing_info);
 
-        //SDL_GL_SwapWindow(window);
-        DXGISwapChainAdapterSwapBuffers(swapchain, vsync);
+        if(use_dxgi) {
+            DXGISwapChainAdapterSwapBuffers(swapchain, vsync);
+        } else {
+            SDL_Internal_SwapBuffersAndMeasureTime_NonDXGI(window);
+        }
     }
 
     return 0;
@@ -128,7 +135,7 @@ void game_render(double delta_time, double frame_percent, void* data) {
     glViewport(0, 0, state->view_w, state->view_h);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(0, 1280, 0, 720, -1, 1); //when using DXGI swapchain the Y axis is inverted... i dont know how to fix on the swapchain level
+    glOrtho(0, 1280, state->yflip?0:720, state->yflip?720:0, -1, 1); //when using DXGI swapchain the Y axis is inverted... i dont know how to fix on the swapchain level
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glClearColor(0, 0, 0, 1);
@@ -164,6 +171,9 @@ void game_render(double delta_time, double frame_percent, void* data) {
         lerp(state->blue_previous_y, state->blue_y, frame_percent) - 20,
         40, 40
     );
+
+    //uncomment this to simulate rendering taking longer (change the number)
+    //SDL_Delay(6);
 }
 void game_fixed_update(double delta_time, void* data) {
     GameState* state = (GameState*)data;
@@ -218,17 +228,109 @@ struct FrameTimingInternal {
     int64_t drift; //the difference between the sum of reported times, and the measured real times
 } frame_timing_info;
 
+struct FrameTimingInternal_NonDXGI {
+    int64_t swap_time;
+    double window_refresh_rate;
+    bool is_actually_vsynced;
+
+    static const int drift_detection_window = 128;
+    int64_t snapped_deltas[drift_detection_window];
+    int64_t realtime_deltas[drift_detection_window];
+    int64_t drift_detection_index;
+    int64_t snapped_total;
+    int64_t realtime_total;
+    int64_t snap_error;
+    int is_vsynced_estimator;
+
+} frame_timing_info_ndxgi;
+
 struct FramePacingInternal {
     int64_t accumulator;
 } frame_pacing_info;
 
+void SDL_Internal_SwapBuffersAndMeasureTime_NonDXGI(SDL_Window* window) {
+    //commented out time and delta here was a futile attempt to "measure if SDL_GL_SwapWindow blocked", 
+    //unfortunately even when it doesnt block it can still take ~0.5ms which is too much error to be useful I think
+    //int64_t time = SDL_GetPerformanceCounter();
+    if(window) SDL_GL_SwapWindow(window);
+    //int64_t delta = SDL_GetPerformanceCounter() - time;
+
+    //timestamp
+    int64_t timestamp = SDL_GetPerformanceCounter();
+    int64_t delta = timestamp - frame_timing_info_ndxgi.swap_time;
+    frame_timing_info_ndxgi.swap_time = timestamp;
+
+    //VSYNC DETECTION (this is the part that is especially annoying without DXGI)
+    int64_t monitor_refresh_period = frame_timing_info.clocks_per_second / frame_timing_info_ndxgi.window_refresh_rate;
+
+    //this is essentially copied from how we do snapping in SDL_Internal_FramePacing_ComputeDeltaTime, except we let it be 0 sometimes
+    //if we are vsynced, this should "not drift over time". so thats how we detect vsync
+    int est_vsyncs = round((double)(delta+frame_timing_info_ndxgi.snap_error) / monitor_refresh_period);
+    int64_t snapped_delta = monitor_refresh_period * est_vsyncs;
+    frame_timing_info_ndxgi.snap_error /= 2; //decay previous snap error
+    frame_timing_info_ndxgi.snap_error += delta - snapped_delta;
+
+    //track realtime / snapped time drift over last 128 refreshes using a circular buffer of recorded times
+    int index = (frame_timing_info_ndxgi.drift_detection_index++)%frame_timing_info_ndxgi.drift_detection_window;
+    frame_timing_info_ndxgi.snapped_total -= frame_timing_info_ndxgi.snapped_deltas[index];
+    frame_timing_info_ndxgi.realtime_total -= frame_timing_info_ndxgi.realtime_deltas[index];
+    frame_timing_info_ndxgi.snapped_deltas[index] = snapped_delta;
+    frame_timing_info_ndxgi.realtime_deltas[index] = delta;
+    frame_timing_info_ndxgi.snapped_total += frame_timing_info_ndxgi.snapped_deltas[index];
+    frame_timing_info_ndxgi.realtime_total += frame_timing_info_ndxgi.realtime_deltas[index];
+
+    //if we are vsynced, the drift should remain small
+    int64_t drift = frame_timing_info_ndxgi.realtime_total - frame_timing_info_ndxgi.snapped_total;
+
+    double error_range = .005; //5ms range for vsync detection (dont know if theres a better way to determine a threshold here, 5ms seems like enough to absorb one-frame measurement error)
+    if(frame_timing_info_ndxgi.drift_detection_index < frame_timing_info_ndxgi.drift_detection_window) {
+        error_range = .1; //if we havent recorded enough frames, 100ms error range instead (this should diverge fast if not actually vsynced, so we dont have to wait too long)
+    }
+
+    bool probably_vsynced = abs(drift) < error_range * frame_timing_info.clocks_per_second;
+    bool prev_vsynced = frame_timing_info_ndxgi.is_actually_vsynced;
+
+    //this bit is copied from my DXGI stuff, because of random spikes the drift can be "off" sometimes, but usually resolved on the next frame. 
+    //we wanna make sure we detect "not vsynced" for a few frames in a row before deciding thats the case
+    //note that if you change modes it can take some time for this detection to kick in (when going from non-vsynced to vsynced)
+    //for that reason it might be useful to flush these buffers if the application changes vsync manually
+    if(frame_timing_info_ndxgi.is_actually_vsynced) {
+        frame_timing_info_ndxgi.is_vsynced_estimator += probably_vsynced?-1:1;
+        if(frame_timing_info_ndxgi.is_vsynced_estimator < 0) frame_timing_info_ndxgi.is_vsynced_estimator = 0;
+        if(frame_timing_info_ndxgi.is_vsynced_estimator >= 4) { //net +4 unsynced frames, we aren't vsynced
+            frame_timing_info_ndxgi.is_actually_vsynced = false;
+
+            frame_timing_info_ndxgi.is_vsynced_estimator = 0;
+        }
+    } else {
+        frame_timing_info_ndxgi.is_vsynced_estimator += probably_vsynced?1:-1;
+        if(frame_timing_info_ndxgi.is_vsynced_estimator < 0) frame_timing_info_ndxgi.is_vsynced_estimator = 0;
+        if(frame_timing_info_ndxgi.is_vsynced_estimator >= 16) { //net +16 vsynced frames, we are probably vsynced
+            frame_timing_info_ndxgi.is_actually_vsynced = true;
+
+            frame_timing_info_ndxgi.is_vsynced_estimator = 0;
+        }
+    }
+
+    //Note: with variable rate refresh, if rendering takes "about as much time as 1 frame" (test this by putting a SDL_Delay in game_render(), 
+    //this can keep swapping between vsynced and non-vsynced timings and the frame pacing ends up kind of jittery,
+    //any frames > 1 refresh period behave as non-vsynced, and any frames < 1 refresh period behave as vsynced
+    //the correct thing to do here is to probably just increase the detection thresholds by a bunch if this case is detected (switching between vsynced / non-vsynced often), in favor of non-vsynced timing
+}
 
 void SDL_Internal_FramePacing_ComputeDeltaTime(DXGISwapChainAdapter* swapchain) {
-    bool is_vsynced = DXGISwapChainAdapterIsActuallyVsynced(swapchain);
+    bool is_vsynced; int64_t current_frametime; int64_t monitor_refresh_period;
+    if(swapchain) {
+        is_vsynced = DXGISwapChainAdapterIsActuallyVsynced(swapchain);
+        current_frametime = DXGISwapChainAdapterGetPresentTimestamp(swapchain);
+        monitor_refresh_period = frame_timing_info.clocks_per_second / DXGISwapChainAdapterRefreshRate(swapchain);
+    } else {
+        is_vsynced = frame_timing_info_ndxgi.is_actually_vsynced;
+        current_frametime = frame_timing_info_ndxgi.swap_time;
+        monitor_refresh_period = frame_timing_info.clocks_per_second / frame_timing_info_ndxgi.window_refresh_rate;
+    }
 
-    int64_t current_frametime = DXGISwapChainAdapterGetPresentTimestamp(swapchain);
     int64_t delta_time = current_frametime - frame_timing_info.prev_frame_time;
-    int64_t monitor_refresh_period = frame_timing_info.clocks_per_second / DXGISwapChainAdapterRefreshRate(swapchain);
 
     if(frame_timing_info.prev_frame_time == 0) { //first update, just report 1 vsync time
         delta_time = monitor_refresh_period;
@@ -270,8 +372,6 @@ void SDL_Internal_FramePacing_ComputeDeltaTime(DXGISwapChainAdapter* swapchain) 
 
     frame_timing_info.delta_time = delta_time;
     frame_timing_info.drift += delta_time;
-
-    std::cout << frame_timing_info.non_vsync_error << std::endl;
 }
 
 Uint64 SDL_GetFrameTime() {
@@ -300,6 +400,16 @@ void SDL_PaceFrame(Uint64 delta_time, SDL_FramePacingInfo* pacing_info) {
 void SDL_Internal_FramePacing_Init(SDL_Window* window) {
     memset(&frame_timing_info, 0, sizeof(frame_timing_info));
     memset(&frame_pacing_info, 0, sizeof(frame_pacing_info));
+    memset(&frame_timing_info_ndxgi, 0, sizeof(frame_timing_info_ndxgi));
+
+    SDL_DisplayID display_index = SDL_GetDisplayForWindow(window);
+    const SDL_DisplayMode* desktop = SDL_GetCurrentDisplayMode(display_index);
+    if(desktop) {
+        frame_timing_info_ndxgi.window_refresh_rate = desktop->refresh_rate;
+    } else {
+        frame_timing_info_ndxgi.window_refresh_rate = 0;
+    }
+    frame_timing_info_ndxgi.is_actually_vsynced = true;
 
     frame_timing_info.clocks_per_second = SDL_GetPerformanceFrequency();
 }
