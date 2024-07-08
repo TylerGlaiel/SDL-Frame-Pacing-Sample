@@ -36,10 +36,10 @@ struct SDL_FramePacingInfo {
 };
 
 void SDL_PaceFrame(Uint64 delta_time, SDL_FramePacingInfo* pacing_info);
-Uint64 SDL_GetFrameTime(SDL_Window* window);
+Uint64 SDL_GetFrameTime();
 
 
-void SDL_Internal_FramePacing_PostPresent(DXGISwapChainAdapter* ctx);
+void SDL_Internal_FramePacing_ComputeDeltaTime(DXGISwapChainAdapter* swapchain);
 void SDL_Internal_FramePacing_Init(SDL_Window* window);
 
 int main(int argc, char* argv[]) {
@@ -56,7 +56,7 @@ int main(int argc, char* argv[]) {
     GameState state = {0};
 
     SDL_FramePacingInfo pacing_info = {0};
-    pacing_info.update_rate = 144;//DXGIGLRefreshRate(ctx);//143.963;
+    pacing_info.update_rate = 144;//DXGISwapChainAdapterRefreshRate(swapchain);//60;
     pacing_info.fixed_update_callback = game_fixed_update;
     pacing_info.variable_update_callback = game_variable_update;
     pacing_info.render_callback = game_render;
@@ -90,13 +90,15 @@ int main(int argc, char* argv[]) {
         };
 
         DXGISwapChainAdapterPrepareBuffers(swapchain);
+        SDL_Internal_FramePacing_ComputeDeltaTime(swapchain);
 
-        Uint64 frame_time = SDL_GetFrameTime(window);
+        Uint64 frame_time = SDL_GetFrameTime();
+       // std::cout << frame_time << std::endl;
+
         SDL_PaceFrame(frame_time, &pacing_info);
 
         //SDL_GL_SwapWindow(window);
         DXGISwapChainAdapterSwapBuffers(swapchain, vsync);
-        SDL_Internal_FramePacing_PostPresent(swapchain);
     }
 
     return 0;
@@ -190,7 +192,7 @@ void game_fixed_update(double delta_time, void* data) {
 void game_variable_update(double delta_time, void* data) {
     //move red box in a sin wave
     GameState* state = (GameState*)data;
-    state->red_timer += delta_time * 2;
+    state->red_timer += delta_time * 10;
 
     state->red_y = 360;
     state->red_x = sin(state->red_timer)*400 + 640;
@@ -207,37 +209,70 @@ void game_variable_update(double delta_time, void* data) {
 //sample frame timing internal
 struct FrameTimingInternal {
     int64_t delta_time;
-
-    //cached queries
     int64_t clocks_per_second;
-    float window_framerate;
-
-    //stuff needed for dumb method
     int64_t prev_frame_time;
-    int64_t current_frame_time;
+    int64_t snap_error;
+    int64_t non_vsync_smoother;
+    int64_t non_vsync_error;
 
-    //stuff needed for smart method
-    bool is_vsynced;
-    bool prev_was_vsynced;
-
-    //ring buffer for vsync detection
-    double vsync_detection_buffer[128];
-    int64_t vsync_detection_buffer_index;
-
-    //ring buffer for frame time smoothing (non-vsynced case)
-    int64_t frametime_buffer[8];
-    int64_t frametime_buffer_index;
-    
-
-    int64_t real_time_tracker;
-    int64_t game_time_tracker;
+    int64_t drift; //the difference between the sum of reported times, and the measured real times
 } frame_timing_info;
 
 struct FramePacingInternal {
     int64_t accumulator;
 } frame_pacing_info;
 
-Uint64 SDL_GetFrameTime(SDL_Window* window) {
+
+void SDL_Internal_FramePacing_ComputeDeltaTime(DXGISwapChainAdapter* swapchain) {
+    bool is_vsynced = DXGISwapChainAdapterIsActuallyVsynced(swapchain);
+
+    int64_t current_frametime = DXGISwapChainAdapterGetPresentTimestamp(swapchain);
+    int64_t delta_time = current_frametime - frame_timing_info.prev_frame_time;
+    int64_t monitor_refresh_period = frame_timing_info.clocks_per_second / DXGISwapChainAdapterRefreshRate(swapchain);
+
+    if(frame_timing_info.prev_frame_time == 0) { //first update, just report 1 vsync time
+        delta_time = monitor_refresh_period;
+    }
+    frame_timing_info.prev_frame_time = current_frametime;
+    frame_timing_info.drift -= delta_time;
+
+    if(is_vsynced) {
+        //if the display adapter thinks we're vsynced, then always snap to the nearest vsync
+        //note: sometimes I get glitch measurements still, even with the accurate frame timing method. 
+        //     this usually appears like a frame with a longer time than it should have, followed by a frame with a lower time than it should have. 
+        //     these sum up to 2 frames worth of time usually, I think, so I think its just an OS scheduling thing messing up when the time is recorded internally
+        //     snap_error is meant to smooth this out slightly, though is not meant to compensate over the long term, so it decays
+        
+        int est_vsyncs = round((double)(delta_time+frame_timing_info.snap_error) / monitor_refresh_period);
+        if(est_vsyncs == 0) est_vsyncs = 1;
+
+        int64_t snapped_time = monitor_refresh_period * est_vsyncs;
+        frame_timing_info.snap_error /= 2; //decay previous snap error
+        frame_timing_info.snap_error += delta_time - snapped_time;
+
+        delta_time = snapped_time;
+        frame_timing_info.non_vsync_error = 0;
+    }
+
+    //non vsynced
+    const double smoothing = 4;
+    frame_timing_info.non_vsync_smoother *= (smoothing-1)/smoothing;
+    frame_timing_info.non_vsync_smoother += (delta_time-frame_timing_info.non_vsync_error) / smoothing;
+
+    if(!is_vsynced){
+        frame_timing_info.non_vsync_error -= delta_time;
+        delta_time = frame_timing_info.non_vsync_smoother;
+        if(delta_time < 0) delta_time = 0;
+        frame_timing_info.non_vsync_error += delta_time;
+    }
+
+    frame_timing_info.delta_time = delta_time;
+    frame_timing_info.drift += delta_time;
+
+    std::cout << frame_timing_info.non_vsync_error << std::endl;
+}
+
+Uint64 SDL_GetFrameTime() {
     return frame_timing_info.delta_time;
 }
 void SDL_PaceFrame(Uint64 delta_time, SDL_FramePacingInfo* pacing_info) {
@@ -264,105 +299,5 @@ void SDL_Internal_FramePacing_Init(SDL_Window* window) {
     memset(&frame_timing_info, 0, sizeof(frame_timing_info));
     memset(&frame_pacing_info, 0, sizeof(frame_pacing_info));
 
-    SDL_DisplayID display_index = SDL_GetDisplayForWindow(window);
-    const SDL_DisplayMode* desktop = SDL_GetCurrentDisplayMode(display_index);
-    if(desktop) {
-        frame_timing_info.window_framerate = desktop->refresh_rate;
-    } else {
-        frame_timing_info.window_framerate = 0;
-    }
-    frame_timing_info.prev_frame_time = SDL_GetPerformanceCounter();
-    frame_timing_info.current_frame_time = frame_timing_info.prev_frame_time;
     frame_timing_info.clocks_per_second = SDL_GetPerformanceFrequency();
-    frame_timing_info.is_vsynced = true; //assume vsync at the start
 }
-
-//this is done in the *dumb* way just so theres a baseline to compare a good implementation to
-void SDL_Internal_FramePacing_PostPresent(DXGISwapChainAdapter* ctx) {
-    frame_timing_info.prev_frame_time = frame_timing_info.current_frame_time;
-    frame_timing_info.current_frame_time = DXGISwapChainAdapterGetPreviousSwapTimestamp(ctx);
-
-    frame_timing_info.delta_time = frame_timing_info.current_frame_time - frame_timing_info.prev_frame_time;
-}
-
-//this was some nonsense I was trying out to smooth out measured times, with the *accurate* DXGI timing instead this is not necessary
-//with accurate DXGI timing, theres still a *small* amount of inaccuracy in measurements, but it seems *extremely small* (a few cycles here and there)
-//so an actual solution would still need to pace this out
-
-/*void SDL_Internal_FramePacing_PostPresent() {
-    //initial timing measurement, track real time
-    frame_timing_info.prev_frame_time = frame_timing_info.current_frame_time;
-    frame_timing_info.current_frame_time = SDL_GetPerformanceCounter();
-    const int64_t measured_delta_time = frame_timing_info.current_frame_time - frame_timing_info.prev_frame_time;
-    frame_timing_info.frametime_buffer[(frame_timing_info.frametime_buffer_index++)%8] = measured_delta_time;
-
-
-    //vsync detection
-    double measured_frametime_seconds = (double)measured_delta_time / frame_timing_info.clocks_per_second;
-    double window_frametime = 1.0 / frame_timing_info.window_framerate;
-
-    int est_vsyncs = round(measured_frametime_seconds / window_frametime);
-    if(est_vsyncs < 1) est_vsyncs = 1;
-    for(int i = 0; i<est_vsyncs && i<128; i++) {
-        frame_timing_info.vsync_detection_buffer[(frame_timing_info.vsync_detection_buffer_index++)%128] = measured_frametime_seconds / est_vsyncs;
-    }
-
-    if(!frame_timing_info.is_vsynced && frame_timing_info.vsync_detection_buffer_index > 128) {
-        double vsync_detection_sum = 0;
-        for(int i = 0; i<128; i++) {
-            vsync_detection_sum += frame_timing_info.vsync_detection_buffer[i];
-        }
-
-        if(abs(vsync_detection_sum - window_frametime*128) < .0001*128) { //if we are "within 0.1ms / frame" of being vsynced, we're probably vsynced
-            frame_timing_info.is_vsynced = true;
-            frame_timing_info.real_time_tracker = 0;
-            frame_timing_info.game_time_tracker = 0;
-        }
-    }
-
-    //if we are vsynced, we should snap measured_delta_time to the nearest vsync multiple
-    if(frame_timing_info.is_vsynced) {
-        int64_t window_frame_time = frame_timing_info.clocks_per_second / frame_timing_info.window_framerate;
-        int64_t snapped_time = round((double)measured_delta_time / window_frame_time) * window_frame_time;
-
-        frame_timing_info.delta_time = snapped_time;
-
-        if(snapped_time == 0) {
-           // frame_timing_info.is_vsynced = false; //if we get a snapped time of 0, we probably arent actually vsynced and should immediately fall back to the non-vsynced version
-            frame_timing_info.delta_time = snapped_time;
-        }
-    }
-
-    //if we are not vsynced, then we should do an average of the last few frames of measurements, + drift compensation
-    if(!frame_timing_info.is_vsynced) {
-        int64_t average = frame_timing_info.real_time_tracker - frame_timing_info.game_time_tracker; //drift compensation
-        //sum frame times
-        for(int i = 0; i<frame_timing_info.frametime_buffer_index && i<8; i++) {
-            average += frame_timing_info.frametime_buffer[i];
-        }
-        int64_t ct = 8;
-        if(frame_timing_info.frametime_buffer_index < 8) ct = frame_timing_info.frametime_buffer_index;
-
-        frame_timing_info.delta_time = average / ct;
-
-        if(frame_timing_info.delta_time < 0) frame_timing_info.delta_time = 0;
-    }
-
-    //track drift
-    frame_timing_info.real_time_tracker += measured_delta_time;
-    frame_timing_info.game_time_tracker += frame_timing_info.delta_time;
-    frame_timing_info.prev_was_vsynced = frame_timing_info.is_vsynced;
-
-    if(frame_timing_info.is_vsynced) {
-        //reset drift detection once per second, if vsynced and no notable drift occured over the last second (we do this before drift detection, so we can ignore anamoulous frame times here)
-        if(frame_timing_info.real_time_tracker > frame_timing_info.clocks_per_second) {
-            frame_timing_info.real_time_tracker = 0;
-            frame_timing_info.game_time_tracker = 0;
-        }
-
-        //if real and game time drift by more than 10ms, we probably arent vsynced
-        if(abs(frame_timing_info.real_time_tracker - frame_timing_info.game_time_tracker) > .01 * frame_timing_info.clocks_per_second) {
-            frame_timing_info.is_vsynced = false;
-        }
-    }
-}*/

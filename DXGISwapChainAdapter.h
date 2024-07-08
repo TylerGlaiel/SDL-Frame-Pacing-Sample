@@ -13,6 +13,9 @@ void DXGISwapChainAdapterResize(DXGISwapChainAdapter* context, int width, int he
 void DXGISwapChainAdapterPrepareBuffers(DXGISwapChainAdapter* context);
 void DXGISwapChainAdapterSwapBuffers(DXGISwapChainAdapter* context, bool vsync);
 double DXGISwapChainAdapterRefreshRate(DXGISwapChainAdapter* context);
-int64_t DXGISwapChainAdapterGetPreviousSwapTimestamp(DXGISwapChainAdapter* context);
+int64_t DXGISwapChainAdapterGetPresentTimestamp(DXGISwapChainAdapter* context);
+bool DXGISwapChainAdapterIsActuallyVsynced(DXGISwapChainAdapter* context);
 
 FrameStatistics DXGISwapChainAdapterGetFrameStatistics(DXGISwapChainAdapter* context);
+
+int64_t DXGISwapChainAdapterGetTimingMethodDelta(DXGISwapChainAdapter* context);

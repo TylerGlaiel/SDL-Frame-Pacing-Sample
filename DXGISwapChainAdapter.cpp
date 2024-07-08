@@ -46,10 +46,16 @@ struct DXGISwapChainAdapter {
     ID3D11RenderTargetView* colorBufferView;
     ID3D11DepthStencilView* depthBufferView;
 
-    bool vsynced;
+
+    int64_t performance_frequency;
     int64_t swap_timestamp;
+    int64_t prev_swap_timestamp;
+    DXGI_FRAME_STATISTICS prev_frame_stats;
     DXGI_FRAME_STATISTICS frame_stats;
     double refresh_rate;
+
+    bool is_actually_vsynced;
+    int is_vsynced_estimator;
 };
 
 //opengl-on-dxgi partially copied from https://github.com/nlguillemot/OpenGL-on-DXGI/blob/master/main.cpp
@@ -208,6 +214,12 @@ DXGISwapChainAdapter* CreateDXGISwapChainAdapter(SDL_Window* window) {
 
     CheckHR(GetRefreshRate(res->device, res->swapChain, &res->refresh_rate));
 
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    res->performance_frequency = freq.QuadPart;
+
+    res->is_actually_vsynced = true; //initial guess should be to assume we are vsynced
+
     return res;
 }
 
@@ -266,12 +278,45 @@ void DXGISwapChainAdapterResize(DXGISwapChainAdapter* context, int width, int he
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, context->dcbNameGL, 0);
 }
 
+static void update_timing_information(DXGISwapChainAdapter* context) {
+    LARGE_INTEGER timestamp;
+    QueryPerformanceCounter(&timestamp);
+
+    context->prev_swap_timestamp = context->swap_timestamp;
+    context->prev_frame_stats = context->frame_stats;
+
+    context->swapChain->GetFrameStatistics(&context->frame_stats);
+    context->swap_timestamp = timestamp.QuadPart;
+
+    //before any frames are pushed, this reports 0, we wanna wait till we got real information before doing vsync detection
+    if(context->frame_stats.SyncQPCTime.QuadPart == 0 || context->prev_frame_stats.SyncQPCTime.QuadPart == 0) return;
+
+    bool was_previous_frame_synced = abs(context->swap_timestamp-context->frame_stats.SyncQPCTime.QuadPart) < .0001 * context->performance_frequency;
+    bool definitely_not_vsynced = context->prev_frame_stats.PresentCount == context->frame_stats.PresentCount;
+
+    if(context->is_actually_vsynced) {
+        context->is_vsynced_estimator += was_previous_frame_synced?-1:1;
+        if(context->is_vsynced_estimator < 0) context->is_vsynced_estimator = 0;
+        if(context->is_vsynced_estimator >= 4) { //net +4 unsynced frames, we aren't vsynced
+            context->is_vsynced_estimator = 0;
+            context->is_actually_vsynced = false;
+        }
+    } else {
+        context->is_vsynced_estimator += was_previous_frame_synced?1:-1;
+        if(context->is_vsynced_estimator < 0 || definitely_not_vsynced) context->is_vsynced_estimator = 0;
+        if(context->is_vsynced_estimator >= 8) { //net +8 vsynced frames, we are probably vsynced
+            context->is_vsynced_estimator = 0;
+            context->is_actually_vsynced = true;
+        }
+    }
+}
+
 void DXGISwapChainAdapterPrepareBuffers(DXGISwapChainAdapter* context) {
     // Wait for swap chain to signal that it is ready to render
     CheckWin32(WaitForSingleObject(context->hFrameLatencyWaitableObject, INFINITE) == WAIT_OBJECT_0);
 
-    //get time after syncing with hFrameLatencyWaitableObject
-    context->swapChain->GetFrameStatistics(&context->frame_stats);
+    update_timing_information(context);
+    
 
     // Fetch the current swapchain backbuffer from the FLIP swap chain
     CheckHR(context->swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&context->dxColorBuffer));
@@ -295,8 +340,6 @@ void DXGISwapChainAdapterPrepareBuffers(DXGISwapChainAdapter* context) {
 }
 
 void DXGISwapChainAdapterSwapBuffers(DXGISwapChainAdapter* context, bool vsync) {
-    context->vsynced = vsync;
-
     // unlock the dsv/rtv
     wglDXUnlockObjectsNV(context->gl_handleD3D, 1, &context->dcbHandleGL);
     wglDXUnlockObjectsNV(context->gl_handleD3D, 1, &context->dsvHandleGL);
@@ -305,21 +348,25 @@ void DXGISwapChainAdapterSwapBuffers(DXGISwapChainAdapter* context, bool vsync) 
     context->devCtx->CopyResource(context->dxColorBuffer, context->dxGlColorBuffer);
 
     CheckHR(context->swapChain->Present(vsync, vsync?0:DXGI_PRESENT_ALLOW_TEARING));
-    LARGE_INTEGER timestamp;
-    QueryPerformanceCounter(&timestamp);
-    context->swap_timestamp = timestamp.QuadPart;
 
     //release current backbuffer back to the swap chain
     context->colorBufferView->Release();
     context->dxColorBuffer->Release();
 }
 
-int64_t DXGISwapChainAdapterGetPreviousSwapTimestamp(DXGISwapChainAdapter* context) {
-    if(context->vsynced) { //if not vsynced, we want to just use the measured time instead of the present time
+int64_t DXGISwapChainAdapterGetPresentTimestamp(DXGISwapChainAdapter* context) {
+    if(context->is_actually_vsynced) { //if not vsynced, we want to just use the measured time instead of the present time
         return context->frame_stats.SyncQPCTime.QuadPart;
     } else {
         return context->swap_timestamp;
     }
+}
+bool DXGISwapChainAdapterIsActuallyVsynced(DXGISwapChainAdapter* context) {
+    return context->is_actually_vsynced;
+}
+
+int64_t DXGISwapChainAdapterGetTimingMethodDelta(DXGISwapChainAdapter* context) {
+    return context->swap_timestamp - context->frame_stats.SyncQPCTime.QuadPart;
 }
 
 FrameStatistics DXGISwapChainAdapterGetFrameStatistics(DXGISwapChainAdapter* context) {
