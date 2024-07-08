@@ -254,7 +254,9 @@ void SDL_Internal_FramePacing_ComputeDeltaTime(DXGISwapChainAdapter* swapchain) 
         frame_timing_info.non_vsync_error = 0;
     }
 
-    //non vsynced
+    //non vsynced, we smooth out the measurements over a few frames
+    //we also keep track of the total time drift and slightly compensate for it in the smoother
+    //this should keep the reported values in non-vsync mode in sync with real time over the long term
     const double smoothing = 4;
     frame_timing_info.non_vsync_smoother *= (smoothing-1)/smoothing;
     frame_timing_info.non_vsync_smoother += (delta_time-frame_timing_info.non_vsync_error) / smoothing;
