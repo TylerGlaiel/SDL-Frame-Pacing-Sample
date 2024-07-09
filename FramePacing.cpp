@@ -49,12 +49,12 @@ int main(int argc, char* argv[]) {
     bool use_dxgi = true;
 
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
-    SDL_Window* window = SDL_CreateWindow("Frame Pacing Sample (vsync on)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow("Frame Pacing Sample (vsync on)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     SDL_Internal_FramePacing_Init(window);
     SDL_GLContext glcontext = SDL_GL_CreateContext(window);
     if(!use_dxgi) SDL_GL_SetSwapInterval(1);
     DXGISwapChainAdapter* swapchain = use_dxgi?CreateDXGISwapChainAdapter(window):NULL;
-   
+
     bool running = true;
     bool vsync = true;
 
@@ -67,9 +67,6 @@ int main(int argc, char* argv[]) {
     pacing_info.variable_update_callback = game_variable_update;
     pacing_info.render_callback = game_render;
     pacing_info.user_data = &state;
-
-
-    int framestats_out_counter = 0;
 
     while(running) {
         SDL_Event event;
@@ -173,7 +170,7 @@ void game_render(double delta_time, double frame_percent, void* data) {
     );
 
     //uncomment this to simulate rendering taking longer (change the number)
-    //SDL_Delay(6);
+    //SDL_Delay(7);
 }
 void game_fixed_update(double delta_time, void* data) {
     GameState* state = (GameState*)data;

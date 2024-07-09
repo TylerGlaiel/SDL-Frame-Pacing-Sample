@@ -288,10 +288,23 @@ static void update_timing_information(DXGISwapChainAdapter* context) {
     context->swapChain->GetFrameStatistics(&context->frame_stats);
     context->swap_timestamp = timestamp.QuadPart;
 
+    int64_t monitor_period = context->performance_frequency / context->refresh_rate;
+
+    //i dont know whether to use present refresh count or sync refresh count here, whats the difference?
+    int missed_presents = (context->frame_stats.PresentRefreshCount - context->prev_frame_stats.PresentRefreshCount) - (context->frame_stats.PresentCount - context->prev_frame_stats.PresentCount);
+
     //before any frames are pushed, this reports 0, we wanna wait till we got real information before doing vsync detection
     if(context->frame_stats.SyncQPCTime.QuadPart == 0 || context->prev_frame_stats.SyncQPCTime.QuadPart == 0) return;
 
-    bool was_previous_frame_synced = abs(context->swap_timestamp-context->frame_stats.SyncQPCTime.QuadPart) < .0001 * context->performance_frequency;
+    //difference between measured time and refresh time after waiting on the latency object
+    //if we are vsynced and not missing frames, this is close to 0
+    //if we are missing frames, this is close to a vsync multiple, however it doesnt appear to be that correlated with the number of missed presents
+    int64_t latency_delta = abs(context->swap_timestamp-context->frame_stats.SyncQPCTime.QuadPart);
+    int snapval = round((double)latency_delta / monitor_period);
+    int64_t expected_delta = monitor_period * snapval;
+    //int64_t expected_delta = missed_presents * (context->performance_frequency/context->refresh_rate); (this seems to only be true ~80 of the time if we are missing frames, so check to snapped vals instead)
+
+    bool was_previous_frame_synced = abs(latency_delta - expected_delta) < .0001 * context->performance_frequency * (snapval+1);
     bool definitely_not_vsynced = context->prev_frame_stats.PresentCount == context->frame_stats.PresentCount;
 
     if(context->is_actually_vsynced) {
@@ -339,7 +352,7 @@ void DXGISwapChainAdapterPrepareBuffers(DXGISwapChainAdapter* context) {
     glBindFramebuffer(GL_FRAMEBUFFER, context->fbo);
 }
 
-void DXGISwapChainAdapterSwapBuffers(DXGISwapChainAdapter* context, bool vsync) {
+void DXGISwapChainAdapterSwapBuffers(DXGISwapChainAdapter* context, int sync_interval) {
     // unlock the dsv/rtv
     wglDXUnlockObjectsNV(context->gl_handleD3D, 1, &context->dcbHandleGL);
     wglDXUnlockObjectsNV(context->gl_handleD3D, 1, &context->dsvHandleGL);
@@ -347,7 +360,7 @@ void DXGISwapChainAdapterSwapBuffers(DXGISwapChainAdapter* context, bool vsync) 
     //copy opengl framebuffer to swapchain framebuffer
     context->devCtx->CopyResource(context->dxColorBuffer, context->dxGlColorBuffer);
 
-    CheckHR(context->swapChain->Present(vsync, vsync?0:DXGI_PRESENT_ALLOW_TEARING));
+    CheckHR(context->swapChain->Present(sync_interval, sync_interval>0?0:DXGI_PRESENT_ALLOW_TEARING));
 
     //release current backbuffer back to the swap chain
     context->colorBufferView->Release();

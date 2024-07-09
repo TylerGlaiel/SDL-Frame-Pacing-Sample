@@ -11,7 +11,7 @@ struct FrameStatistics {
 DXGISwapChainAdapter* CreateDXGISwapChainAdapter(SDL_Window* window);
 void DXGISwapChainAdapterResize(DXGISwapChainAdapter* context, int width, int height);
 void DXGISwapChainAdapterPrepareBuffers(DXGISwapChainAdapter* context);
-void DXGISwapChainAdapterSwapBuffers(DXGISwapChainAdapter* context, bool vsync);
+void DXGISwapChainAdapterSwapBuffers(DXGISwapChainAdapter* context, int sync_interval);
 double DXGISwapChainAdapterRefreshRate(DXGISwapChainAdapter* context);
 int64_t DXGISwapChainAdapterGetPresentTimestamp(DXGISwapChainAdapter* context);
 bool DXGISwapChainAdapterIsActuallyVsynced(DXGISwapChainAdapter* context);
